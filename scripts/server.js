@@ -246,38 +246,160 @@ app.get("/files-list", async (req, res) => {
 });
 
 // ====== Delete by filename/url ======
-app.delete("/images", express.json(), async (req, res) => {
-  try {
-    const { filenames = [], urls = [] } = req.body || {};
-    const targets = new Set(filenames);
-    for (const u of urls) {
+// app.delete("/images", express.json(), async (req, res) => {
+//   try {
+//     const { filenames = [], urls = [] } = req.body || {};
+//     const targets = new Set(filenames);
+//     for (const u of urls) {
+//       try {
+//         const p = new URL(u).pathname; // /files/NAME
+//         const m = p.match(/\/files\/(.+)$/);
+//         if (m) targets.add(decodeURIComponent(m[1]));
+//       } catch {}
+//     }
+//     if (targets.size === 0) return res.status(400).json({ error: "Provide filenames or urls" });
+
+//     const db = await readDB();
+//     const kept = [];
+//     const deleted = [];
+//     for (const it of db.images) {
+//       if (targets.has(it.filename)) {
+//         try { await fsp.unlink(path.join(UPLOADS_DIR, it.filename)); } catch {}
+//         deleted.push(it.filename);
+//       } else {
+//         kept.push(it);
+//       }
+//     }
+//     db.images = kept;
+//     await writeDB(db);
+//     res.json({ deleted, count: deleted.length });
+//   } catch (e) {
+//     console.error("[delete] error:", e);
+//     res.status(500).json({ error: "Delete failed" });
+//   }
+// });
+// ===== PARSER BODY (tambah ini) =====
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+// ===== util keamanan path untuk hapus file =====
+function safeJoin(root, rel) {
+  const full = path.join(root, rel);
+  const resolved = path.resolve(full);
+  const rootResolved = path.resolve(root);
+  if (resolved !== rootResolved && !resolved.startsWith(rootResolved + path.sep)) {
+    throw new Error("Invalid path");
+  }
+  return resolved;
+}
+
+// ===== helper kumpulkan target dari JSON / form / query =====
+function collectTargets(req) {
+  const targets = new Set();
+
+  const add = (v) => {
+    if (!v) return;
+    if (Array.isArray(v)) v.forEach(add);
+    else targets.add(String(v));
+  };
+
+  const b = req.body || {};
+  add(b.filename);
+  add(b.filenames);
+  if (b.url) {
+    try {
+      const m = new URL(b.url).pathname.match(/\/files\/(.+)$/);
+      if (m) targets.add(decodeURIComponent(m[1]));
+    } catch {}
+  }
+  if (Array.isArray(b.urls)) {
+    b.urls.forEach((u) => {
       try {
-        const p = new URL(u).pathname; // /files/NAME
-        const m = p.match(/\/files\/(.+)$/);
+        const m = new URL(u).pathname.match(/\/files\/(.+)$/);
         if (m) targets.add(decodeURIComponent(m[1]));
       } catch {}
-    }
-    if (targets.size === 0) return res.status(400).json({ error: "Provide filenames or urls" });
+    });
+  }
 
-    const db = await readDB();
-    const kept = [];
-    const deleted = [];
-    for (const it of db.images) {
-      if (targets.has(it.filename)) {
-        try { await fsp.unlink(path.join(UPLOADS_DIR, it.filename)); } catch {}
-        deleted.push(it.filename);
-      } else {
-        kept.push(it);
-      }
+  // dukung query string juga (?filename=...&filenames=a,b,c)
+  if (req.query.filename) add(req.query.filename);
+  if (req.query.filenames) {
+    const arr = Array.isArray(req.query.filenames)
+      ? req.query.filenames
+      : String(req.query.filenames).split(",");
+    arr.map((s) => s.trim()).forEach(add);
+  }
+
+  return targets;
+}
+
+// ===== logika inti hapus (pakai DB + hapus file di disk) =====
+async function deleteByTargets(targets) {
+  if (!targets || targets.size === 0) {
+    return { deleted: [], kept: [] };
+  }
+  const db = await readDB();
+  const kept = [];
+  const deleted = [];
+  for (const it of db.images || []) {
+    if (targets.has(it.filename)) {
+      try {
+        await fsp.unlink(safeJoin(UPLOADS_DIR, it.filename));
+      } catch { /* file mungkin sudah tidak ada */ }
+      deleted.push(it.filename);
+    } else {
+      kept.push(it);
     }
-    db.images = kept;
-    await writeDB(db);
-    res.json({ deleted, count: deleted.length });
+  }
+  db.images = kept;
+  await writeDB(db);
+  return { deleted, kept };
+}
+
+// ===== Delete (SEMUA BENTUK) =====
+
+// a) FE kamu request POST /delete  -> layani di sini
+app.post("/delete", async (req, res) => {
+  try {
+    const targets = collectTargets(req);
+    if (targets.size === 0) return res.status(400).json({ error: "Provide filenames or urls" });
+    const { deleted } = await deleteByTargets(targets);
+    return res.json({ deleted, count: deleted.length, method: "POST /delete" });
   } catch (e) {
-    console.error("[delete] error:", e);
-    res.status(500).json({ error: "Delete failed" });
+    console.error("[delete POST] error:", e);
+    return res.status(500).json({ error: "Delete failed" });
   }
 });
+
+// b) juga dukung DELETE /delete dengan body/query sama
+app.delete("/delete", async (req, res) => {
+  try {
+    const targets = collectTargets(req);
+    if (targets.size === 0) return res.status(400).json({ error: "Provide filenames or urls" });
+    const { deleted } = await deleteByTargets(targets);
+    return res.json({ deleted, count: deleted.length, method: "DELETE /delete" });
+  } catch (e) {
+    console.error("[delete DELETE] error:", e);
+    return res.status(500).json({ error: "Delete failed" });
+  }
+});
+
+// c) convenience: DELETE /files/:name  (hapus satu file)
+app.delete("/files/:name", async (req, res) => {
+  try {
+    const name = decodeURIComponent(req.params.name || "");
+    if (!name) return res.status(400).json({ error: "Missing filename" });
+    const { deleted } = await deleteByTargets(new Set([name]));
+    const ok = deleted.includes(name);
+    return res.status(ok ? 200 : 404).json({ deleted: ok ? [name] : [], count: ok ? 1 : 0, method: "DELETE /files/:name" });
+  } catch (e) {
+    console.error("[delete one] error:", e);
+    return res.status(500).json({ error: "Delete failed" });
+  }
+});
+
+// (opsional) tetap pertahankan rute lama yang kamu punya:
+// app.delete("/images", express.json(), async (req, res) => { ... })
 
 // ====== Healthcheck ======
 app.get("/health", (_req, res) => res.send("ok"));
