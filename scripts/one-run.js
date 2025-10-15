@@ -1,80 +1,168 @@
-const { spawn } = require("child_process")
+#!/usr/bin/env node
+/**
+ * One runner for backend + Next.js (dev/start)
+ * Fitur:
+ * - Default URL backend ke domain (bukan localhost)
+ * - Graceful shutdown: Ctrl+C mematikan keduanya
+ * - Jika salah satu proses exit, yang lain ikut di-kill
+ *
+ * Pakai:
+ *   node scripts/one-run.js dev --turbopack
+ *   node scripts/one-run.js start
+ *
+ * ENV yang bisa di-override:
+ *   NEXT_PUBLIC_BACKEND_URL, PUBLIC_BASE_URL, PORT (backend), NEXT_PORT (Next.js),
+ *   UPLOADS_DIR, DATA_DIR
+ */
 
+const { spawn } = require("child_process");
+const path = require("path");
+const os = require("os");
 
-const MODE = process.argv[2] || (process.env.NODE_ENV === "production" ? "start" : "dev")
-const NEXT_PORT = "3001"
-const BACKEND_CMD = "node"
-const BACKEND_ARGS = ["scripts/server.js"]
-const NEXT_BIN = "next" // uses local node_modules/.bin/next
+const args = process.argv.slice(2);
+const mode = (args[0] || "dev").toLowerCase(); // dev | start
+const extraArgs = args.slice(1);
+
+// ===== Path dasar project
+const repoRoot = path.resolve(__dirname, "..");
+
+// ===== Default ENV (bisa dioverride lewat ENV saat run)
+const backendPort = process.env.PORT || "4000";
+const nextPort = process.env.NEXT_PORT || "3001";
+
+// WARNING: agar FE tidak balik ke localhost, default-kan ke domain.
+// (Kalau mau path relatif saat dev, set NEXT_PUBLIC_BACKEND_URL="" sebelum menjalankan.)
+const DEFAULT_DOMAIN = "https://uploadimage.xyz";
 
 const baseEnv = {
   ...process.env,
-  // ensure frontend points to backend on 4000 by default
-  NEXT_PUBLIC_BACKEND_URL: process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000",
-}
+  // FE → domain (bisa override)
+  NEXT_PUBLIC_BACKEND_URL:
+    process.env.NEXT_PUBLIC_BACKEND_URL ?? DEFAULT_DOMAIN,
+  // BE → gunakan domain untuk membangun URL file absolut
+  PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || DEFAULT_DOMAIN,
+  // Lokasi penyimpanan (default: folder di dalam project — sesuai setup kamu sekarang)
+  UPLOADS_DIR:
+    process.env.UPLOADS_DIR ||
+    path.join(repoRoot, "uploads"),
+  DATA_DIR:
+    process.env.DATA_DIR ||
+    path.join(repoRoot, "data"),
+  // Port
+  PORT: backendPort,
+};
 
-function run(name, cmd, args, opts = {}) {
-  console.log(`[v0] starting ${name}: ${cmd} ${args.join(" ")}`)
-  const child = spawn(cmd, args, {
+// ===== Util: spawn & kill tree
+function startChild(label, cmd, cmdArgs, env) {
+  const isWin = process.platform === "win32";
+  const child = spawn(cmd, cmdArgs, {
+    cwd: repoRoot,
     stdio: "inherit",
-    shell: process.platform === "win32",
-    env: { ...baseEnv, ...(opts.env || {}) },
-    ...opts,
-  })
-  child.on("error", (err) => {
-    console.error(`[v0] ${name} failed to start:`, err?.message)
-  })
+    env,
+    detached: !isWin, // supaya bisa kill group di POSIX
+    shell: false,
+  });
+  child._label = label;
   child.on("exit", (code, signal) => {
-    console.log(`[v0] ${name} exited code=${code} signal=${signal}`)
-    // if one exits, shut down the other to avoid orphans
-    process.exit(code ?? 0)
-  })
-  return child
+    console.log(`[${label}] exited with code=${code} signal=${signal}`);
+  });
+  return child;
 }
 
-let backendProc, nextProc
-
-function start() {
-  // Backend (Express/json-server) — expected to listen on 4000
-  backendProc = run("backend", BACKEND_CMD, BACKEND_ARGS)
-
-  if (MODE === "start") {
-    const build = run("next-build", NEXT_BIN, ["build"], { env: { ...baseEnv, NODE_ENV: "production" } })
-    build.on("exit", (code) => {
-      if (code !== 0) {
-        console.error("[v0] next build failed")
-        process.exit(code ?? 1)
+function killTree(child, signal = "SIGTERM") {
+  if (!child || child.killed) return;
+  const pid = child.pid;
+  if (!pid) return;
+  const isWin = process.platform === "win32";
+  try {
+    if (isWin) {
+      // Kill tree pada Windows
+      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+      });
+    } else {
+      // Kill the whole group
+      try {
+        process.kill(-pid, signal);
+      } catch {
+        process.kill(pid, signal);
       }
-      const nextArgs = ["start", "-p", NEXT_PORT]
-      nextProc = run("next", NEXT_BIN, nextArgs, { env: { ...baseEnv, NODE_ENV: "production" } })
-    })
-  } else {
-    // Next on port 3001 in dev mode
-    const nextArgs = ["dev", "-p", NEXT_PORT]
-    nextProc = run("next", NEXT_BIN, nextArgs, { env: baseEnv })
+    }
+  } catch {}
+}
+
+// ===== Cetak info ENV penting
+function printBanner() {
+  console.log(
+    `[v0] PUBLIC_BASE_URL: ${baseEnv.PUBLIC_BASE_URL}\n` +
+      `[v0] NEXT_PUBLIC_BACKEND_URL: ${baseEnv.NEXT_PUBLIC_BACKEND_URL}\n` +
+      `[v0] UPLOADS_DIR: ${baseEnv.UPLOADS_DIR}\n` +
+      `[v0] DATA_DIR: ${baseEnv.DATA_DIR}\n` +
+      `[v0] Ports: backend=${backendPort}, next=${nextPort}\n`
+  );
+  if (baseEnv.NEXT_PUBLIC_BACKEND_URL === "") {
+    console.log(
+      "[warn] NEXT_PUBLIC_BACKEND_URL kosong → FE akan fetch path relatif. Pastikan ada reverse proxy (Nginx) yang meneruskan /images, /upload, dll ke backend."
+    );
   }
 }
 
-function shutdown() {
-  console.log("[v0] shutting down...")
-  try {
-    if (nextProc && !nextProc.killed) nextProc.kill("SIGINT")
-  } catch {}
-  try {
-    if (backendProc && !backendProc.killed) backendProc.kill("SIGINT")
-  } catch {}
-  setTimeout(() => process.exit(0), 500).unref()
+printBanner();
+
+// ===== Start backend
+console.log("[v0] starting backend: node scripts/server.js");
+const backend = startChild("backend", process.execPath, [
+  path.join("scripts", "server.js"),
+]);
+
+// ===== Start Next.js (dev|start)
+let nextCmd = "";
+let nextArgs = [];
+if (mode === "start") {
+  nextCmd = os.platform() === "win32" ? "npx.cmd" : "npx";
+  nextArgs = ["next", "start", "-p", nextPort, ...extraArgs];
+  console.log(`[v0] starting next: next start -p ${nextPort} ${extraArgs.join(" ")}`);
+} else {
+  nextCmd = os.platform() === "win32" ? "npx.cmd" : "npx";
+  // gunakan dev; forward argumen seperti --turbopack kalau ada
+  nextArgs = ["next", "dev", "-p", nextPort, ...extraArgs];
+  console.log(`[v0] starting next: next dev -p ${nextPort} ${extraArgs.join(" ")}`);
+}
+const nextProc = startChild("next", nextCmd, nextArgs, baseEnv);
+
+// ===== Graceful shutdown & fail-fast
+let shuttingDown = false;
+function shutdown(status = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log("[v0] shutting down...");
+  killTree(nextProc, "SIGTERM");
+  killTree(backend, "SIGTERM");
+  // tunggu sebentar, lalu paksa jika masih hidup
+  setTimeout(() => {
+    killTree(nextProc, "SIGKILL");
+    killTree(backend, "SIGKILL");
+    process.exit(status);
+  }, 1500);
 }
 
-process.on("SIGINT", shutdown)
-process.on("SIGTERM", shutdown)
-process.on("uncaughtException", (e) => {
-  console.error("[v0] uncaughtException:", e)
-  shutdown()
-})
-process.on("unhandledRejection", (e) => {
-  console.error("[v0] unhandledRejection:", e)
-  shutdown()
-})
+process.on("SIGINT", () => {
+  console.log("\n[v0] SIGINT (Ctrl+C) received");
+  shutdown(0);
+});
+process.on("SIGTERM", () => {
+  console.log("\n[v0] SIGTERM received");
+  shutdown(0);
+});
 
-start()
+// Jika salah satu proses mati terlebih dulu, matikan yang lain
+function wireExit(child) {
+  child.on("close", (code) => {
+    if (!shuttingDown) {
+      console.log(`[v0] ${child._label} closed (code=${code}). Stopping others...`);
+      shutdown(code || 0);
+    }
+  });
+}
+wireExit(backend);
+wireExit(nextProc);
