@@ -10,7 +10,7 @@
  * - PORT (default 4000)
  * - UPLOADS_DIR (default /tmp/uploads)
  * - DATA_DIR (default /tmp/data)
- * - PUBLIC_BASE_URL (default https://uploadimage.xyz)  <-- kunci!
+ * - PUBLIC_BASE_URL (default https://uploadimage.xyz)
  */
 
 const fs = require("fs");
@@ -27,7 +27,7 @@ const PORT = parseInt(process.env.PORT || "4000", 10);
 const UPLOADS_DIR = process.env.UPLOADS_DIR || "/tmp/uploads";
 const DATA_DIR = process.env.DATA_DIR || "/tmp/data";
 const DB_FILE = path.join(DATA_DIR, "db.json");
-// Default dipaksa ke domain kamu, bisa dioverride via ENV
+// Default ke domain kamu; bisa override via ENV
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://uploadimage.xyz").replace(/\/+$/, "");
 
 // ====== Bootstrap folder/data ======
@@ -65,12 +65,15 @@ app.use((req, res, next) => {
   next();
 });
 
-// Base URL selalu memakai PUBLIC_BASE_URL (bukan host request)
+// Body parser untuk JSON & form-urlencoded
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+// Base URL selalu memakai PUBLIC_BASE_URL
 function externalBase() {
   return PUBLIC_BASE_URL;
 }
 function buildFileUrl(filenameOrRelPath) {
-  // dukung relPath (subfolder) maupun filename
   const rel = String(filenameOrRelPath).replace(/^\/+/, "");
   return `${externalBase()}/files/${encodeURI(rel)}`.replace(/#/g, "%23");
 }
@@ -92,7 +95,7 @@ app.use(
 // ====== Upload (multer) — field name: "files" ======
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => cb(null, file.originalname), // simpan nama asli
+  filename: (req, file, cb) => cb(null, file.originalname),
 });
 const upload = multer({ storage });
 
@@ -123,7 +126,7 @@ app.post("/upload", upload.array("files", 200), async (req, res) => {
       }
       results.push({
         filename,
-        url: buildFileUrl(filename), // ABSOLUT ke domain kamu
+        url: buildFileUrl(filename),
         status: idx >= 0 ? "overwritten" : "uploaded",
       });
     }
@@ -206,7 +209,7 @@ app.get("/files-list", async (req, res) => {
       })
       .map(f => {
         const filename = path2.basename(f.relPath);
-        const url = buildFileUrl(f.relPath); // ABSOLUT ke domain kamu
+        const url = buildFileUrl(f.relPath);
         const ext = path2.extname(filename).slice(1).toLowerCase();
         const mime =
           ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
@@ -245,44 +248,10 @@ app.get("/files-list", async (req, res) => {
   }
 });
 
-// ====== Delete by filename/url ======
-// app.delete("/images", express.json(), async (req, res) => {
-//   try {
-//     const { filenames = [], urls = [] } = req.body || {};
-//     const targets = new Set(filenames);
-//     for (const u of urls) {
-//       try {
-//         const p = new URL(u).pathname; // /files/NAME
-//         const m = p.match(/\/files\/(.+)$/);
-//         if (m) targets.add(decodeURIComponent(m[1]));
-//       } catch {}
-//     }
-//     if (targets.size === 0) return res.status(400).json({ error: "Provide filenames or urls" });
+// ====== DELETE: dukung JSON, URL-encoded, & FormData (multipart) ======
+const parseFields = multer().none(); // parser multipart TANPA file (untuk tombol FE)
 
-//     const db = await readDB();
-//     const kept = [];
-//     const deleted = [];
-//     for (const it of db.images) {
-//       if (targets.has(it.filename)) {
-//         try { await fsp.unlink(path.join(UPLOADS_DIR, it.filename)); } catch {}
-//         deleted.push(it.filename);
-//       } else {
-//         kept.push(it);
-//       }
-//     }
-//     db.images = kept;
-//     await writeDB(db);
-//     res.json({ deleted, count: deleted.length });
-//   } catch (e) {
-//     console.error("[delete] error:", e);
-//     res.status(500).json({ error: "Delete failed" });
-//   }
-// });
-// ===== PARSER BODY (tambah ini) =====
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
-
-// ===== util keamanan path untuk hapus file =====
+// keamanan path
 function safeJoin(root, rel) {
   const full = path.join(root, rel);
   const resolved = path.resolve(full);
@@ -293,59 +262,82 @@ function safeJoin(root, rel) {
   return resolved;
 }
 
-// ===== helper kumpulkan target dari JSON / form / query =====
+// kumpulkan target dari berbagai bentuk body/query
 function collectTargets(req) {
   const targets = new Set();
 
+  const pushOne = (s) => { if (s) targets.add(String(s)); };
+
   const add = (v) => {
     if (!v) return;
-    if (Array.isArray(v)) v.forEach(add);
-    else targets.add(String(v));
+    if (Array.isArray(v)) { v.forEach(add); return; }
+
+    if (typeof v === "object") {
+      // array of objects { filename } | { url }
+      if (v.filename) pushOne(v.filename);
+      if (v.url) {
+        try {
+          const m = new URL(String(v.url)).pathname.match(/\/files\/(.+)$/);
+          if (m) pushOne(decodeURIComponent(m[1]));
+        } catch {}
+      }
+      return;
+    }
+
+    // string: bisa "a.jpg", "a.jpg,b.jpg", atau '["a.jpg","b.jpg"]'
+    const s = String(v).trim();
+    if (!s) return;
+    if (s.startsWith("[") && s.endsWith("]")) {
+      try {
+        const arr = JSON.parse(s);
+        if (Array.isArray(arr)) arr.forEach(add);
+        else pushOne(s);
+      } catch { pushOne(s); }
+      return;
+    }
+    if (s.includes(",")) {
+      s.split(",").map(t => t.trim()).filter(Boolean).forEach(pushOne);
+      return;
+    }
+    pushOne(s);
   };
 
   const b = req.body || {};
   add(b.filename);
   add(b.filenames);
-  if (b.url) {
-    try {
-      const m = new URL(b.url).pathname.match(/\/files\/(.+)$/);
-      if (m) targets.add(decodeURIComponent(m[1]));
-    } catch {}
-  }
-  if (Array.isArray(b.urls)) {
-    b.urls.forEach((u) => {
-      try {
-        const m = new URL(u).pathname.match(/\/files\/(.+)$/);
-        if (m) targets.add(decodeURIComponent(m[1]));
-      } catch {}
-    });
-  }
+  add(b.name);
+  add(b.names);
+  add(b.id);
+  add(b.ids);
+  add(b.file);
+  add(b.files);
+  add(b.image);
+  add(b.images);
+  add(b.item);
+  add(b.items);
+  add(b.selected);
+  add(b.selectedImage);
+  add(b.selectedImages);
 
-  // dukung query string juga (?filename=...&filenames=a,b,c)
-  if (req.query.filename) add(req.query.filename);
-  if (req.query.filenames) {
-    const arr = Array.isArray(req.query.filenames)
-      ? req.query.filenames
-      : String(req.query.filenames).split(",");
-    arr.map((s) => s.trim()).forEach(add);
-  }
+  if (b.url) add(b.url);
+  if (b.urls) add(b.urls);
+
+  // dukung query (?filename=...&filenames=a,b)
+  const q = req.query || {};
+  add(q.filename);
+  add(q.filenames);
 
   return targets;
 }
 
-// ===== logika inti hapus (pakai DB + hapus file di disk) =====
 async function deleteByTargets(targets) {
-  if (!targets || targets.size === 0) {
-    return { deleted: [], kept: [] };
-  }
+  if (!targets || targets.size === 0) return { deleted: [], kept: [] };
   const db = await readDB();
   const kept = [];
   const deleted = [];
   for (const it of db.images || []) {
     if (targets.has(it.filename)) {
-      try {
-        await fsp.unlink(safeJoin(UPLOADS_DIR, it.filename));
-      } catch { /* file mungkin sudah tidak ada */ }
+      try { await fsp.unlink(safeJoin(UPLOADS_DIR, it.filename)); } catch {}
       deleted.push(it.filename);
     } else {
       kept.push(it);
@@ -356,10 +348,8 @@ async function deleteByTargets(targets) {
   return { deleted, kept };
 }
 
-// ===== Delete (SEMUA BENTUK) =====
-
-// a) FE kamu request POST /delete  -> layani di sini
-app.post("/delete", async (req, res) => {
+// a) FE: POST /delete (FormData/JSON)
+app.post("/delete", parseFields, async (req, res) => {
   try {
     const targets = collectTargets(req);
     if (targets.size === 0) return res.status(400).json({ error: "Provide filenames or urls" });
@@ -371,8 +361,8 @@ app.post("/delete", async (req, res) => {
   }
 });
 
-// b) juga dukung DELETE /delete dengan body/query sama
-app.delete("/delete", async (req, res) => {
+// b) DELETE /delete (body/query sama)
+app.delete("/delete", parseFields, async (req, res) => {
   try {
     const targets = collectTargets(req);
     if (targets.size === 0) return res.status(400).json({ error: "Provide filenames or urls" });
@@ -384,7 +374,7 @@ app.delete("/delete", async (req, res) => {
   }
 });
 
-// c) convenience: DELETE /files/:name  (hapus satu file)
+// c) DELETE /files/:name (hapus satu file)
 app.delete("/files/:name", async (req, res) => {
   try {
     const name = decodeURIComponent(req.params.name || "");
@@ -397,9 +387,6 @@ app.delete("/files/:name", async (req, res) => {
     return res.status(500).json({ error: "Delete failed" });
   }
 });
-
-// (opsional) tetap pertahankan rute lama yang kamu punya:
-// app.delete("/images", express.json(), async (req, res) => { ... })
 
 // ====== Healthcheck ======
 app.get("/health", (_req, res) => res.send("ok"));
