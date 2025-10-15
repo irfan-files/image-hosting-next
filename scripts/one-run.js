@@ -113,7 +113,7 @@ printBanner();
 console.log("[v0] starting backend: node scripts/server.js");
 const backend = startChild("backend", process.execPath, [
   path.join("scripts", "server.js"),
-]);
+], baseEnv);
 
 // ===== Start Next.js (dev|start)
 let nextCmd = "";
