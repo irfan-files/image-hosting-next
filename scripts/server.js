@@ -1,19 +1,16 @@
 /**
- * Image backend (Express) — single file, drop-in
- * Fitur:
- * - Serve file statis di /files/{filename} dari UPLOADS_DIR
- * - Upload multiple files (field: "files"), simpan nama asli (overwrite jika sama)
- * - List metadata di /images (URL absolut mengikuti domain via X-Forwarded-* atau PUBLIC_BASE_URL)
- * - DB JSON sederhana di DATA_DIR/db.json
- * - (Opsional) mount json-server di /db jika package tersedia
+ * Image backend (Express) — drop-in
+ * - /files/{filename} -> serve dari UPLOADS_DIR
+ * - /upload (field: "files") -> simpan nama asli (overwrite jika sama)
+ * - /images -> daftar meta + URL ABSOLUT sesuai PUBLIC_BASE_URL
+ * - /files-list -> scan folder upload langsung (tanpa DB)
+ * - DB JSON di DATA_DIR/db.json ; optional json-server di /db
  *
- * ENV yang didukung:
+ * ENV:
  * - PORT (default 4000)
  * - UPLOADS_DIR (default /tmp/uploads)
  * - DATA_DIR (default /tmp/data)
- * - PUBLIC_BASE_URL (optional; contoh: https://uploadimage.xyz)
- *
- * Jalankan: node scripts/server.js
+ * - PUBLIC_BASE_URL (default https://uploadimage.xyz)  <-- kunci!
  */
 
 const fs = require("fs");
@@ -30,7 +27,8 @@ const PORT = parseInt(process.env.PORT || "4000", 10);
 const UPLOADS_DIR = process.env.UPLOADS_DIR || "/tmp/uploads";
 const DATA_DIR = process.env.DATA_DIR || "/tmp/data";
 const DB_FILE = path.join(DATA_DIR, "db.json");
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ""; // ex: https://uploadimage.xyz
+// Default dipaksa ke domain kamu, bisa dioverride via ENV
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://uploadimage.xyz").replace(/\/+$/, "");
 
 // ====== Bootstrap folder/data ======
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -56,7 +54,7 @@ async function writeDB(db) {
 
 // ====== Express app ======
 const app = express();
-app.set("trust proxy", 1); // penting jika di belakang Nginx/Reverse Proxy
+app.set("trust proxy", 1);
 
 // CORS ringan (opsional)
 app.use((req, res, next) => {
@@ -67,22 +65,14 @@ app.use((req, res, next) => {
   next();
 });
 
-// Hitung base URL dari header proxy (atau PUBLIC_BASE_URL)
-function externalBase(req) {
-  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/+$/, "");
-  const proto = req.headers["x-forwarded-proto"] || req.protocol;
-  const host = req.headers["x-forwarded-host"] || req.get("host");
-  return `${proto}://${host}`;
+// Base URL selalu memakai PUBLIC_BASE_URL (bukan host request)
+function externalBase() {
+  return PUBLIC_BASE_URL;
 }
-function _externalBase(req) {
-  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/+$/, "");
-  const proto = req.headers["x-forwarded-proto"] || req.protocol;
-  const host  = req.headers["x-forwarded-host"]  || req.get("host");
-  return `${proto}://${host}`;
-}
-function buildFileUrl(req, filename) {
-  const base = externalBase(req);
-  return `${base}/files/${encodeURIComponent(filename)}`;
+function buildFileUrl(filenameOrRelPath) {
+  // dukung relPath (subfolder) maupun filename
+  const rel = String(filenameOrRelPath).replace(/^\/+/, "");
+  return `${externalBase()}/files/${encodeURI(rel)}`.replace(/#/g, "%23");
 }
 
 // ====== Static /files (prefix DIPERTAHANKAN) ======
@@ -92,7 +82,6 @@ app.use(
     index: false,
     fallthrough: true,
     setHeaders: (res) => {
-      // cache panjang untuk asset gambar (opsional)
       res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       res.setHeader("X-Content-Type-Options", "nosniff");
       res.setHeader("Content-Security-Policy", "default-src 'none'");
@@ -103,13 +92,66 @@ app.use(
 // ====== Upload (multer) — field name: "files" ======
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    // Simpan nama asli (overwrite jika clash)
-    cb(null, file.originalname);
-  },
+  filename: (req, file, cb) => cb(null, file.originalname), // simpan nama asli
 });
 const upload = multer({ storage });
 
+// Upload: simpan meta di DB (tanpa host), balas URL absolut berbasis PUBLIC_BASE_URL
+app.post("/upload", upload.array("files", 200), async (req, res) => {
+  try {
+    const files = req.files || [];
+    const now = new Date().toISOString();
+    const db = await readDB();
+
+    const results = [];
+    for (const f of files) {
+      const filename = f.originalname;
+      const idx = db.images.findIndex((x) => x.filename === filename);
+      const record = {
+        id: filename,
+        filename,
+        size: f.size,
+        type: f.mimetype,
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (idx >= 0) {
+        record.createdAt = db.images[idx].createdAt || now;
+        db.images[idx] = record;
+      } else {
+        db.images.push(record);
+      }
+      results.push({
+        filename,
+        url: buildFileUrl(filename), // ABSOLUT ke domain kamu
+        status: idx >= 0 ? "overwritten" : "uploaded",
+      });
+    }
+
+    await writeDB(db);
+    res.json({ uploaded: results, count: results.length });
+  } catch (e) {
+    console.error("[upload] error:", e);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+// List images: selalu bangun URL dari filename (abaikan url lama di DB)
+app.get("/images", async (_req, res) => {
+  try {
+    const db = await readDB();
+    const list = (db.images || []).map((it) => ({
+      ...it,
+      url: buildFileUrl(it.filename),
+    }));
+    res.json(list);
+  } catch (e) {
+    console.error("[images] error:", e);
+    res.status(500).json({ error: "Failed to load images" });
+  }
+});
+
+// ====== Scan folder langsung (tanpa DB) ======
 async function walkDir(root, recursive) {
   const out = [];
   const stack = [""];
@@ -124,8 +166,7 @@ async function walkDir(root, recursive) {
         if (recursive) stack.push(relPath);
         continue;
       }
-      // skip hidden files (opsional)
-      if (ent.name.startsWith(".")) continue;
+      if (ent.name.startsWith(".")) continue; // skip hidden
       try {
         const st = statSync(full);
         out.push({
@@ -144,26 +185,19 @@ app.get("/files-list", async (req, res) => {
   try {
     const q = req.query || {};
     const recursive = String(q.recursive || "").toLowerCase() === "true";
-    const format    = (q.format || "").toLowerCase();      // "txt" untuk daftar URL saja
-    const sortBy    = (q.sort || "name").toLowerCase();    // name|mtime|size
-    const order     = (q.order || "asc").toLowerCase();    // asc|desc
-    const limit     = Math.max(0, parseInt(q.limit || "0", 10));
-    const offset    = Math.max(0, parseInt(q.offset || "0", 10));
+    const format = (q.format || "").toLowerCase(); // "txt"
+    const sortBy = (q.sort || "name").toLowerCase(); // name|mtime|size
+    const order = (q.order || "asc").toLowerCase(); // asc|desc
+    const limit = Math.max(0, parseInt(q.limit || "0", 10));
+    const offset = Math.max(0, parseInt(q.offset || "0", 10));
 
-    // filter ekstensi
     let exts = null;
     if (q.ext) {
-      exts = String(q.ext)
-        .split(",")
-        .map(s => s.trim().toLowerCase())
-        .filter(Boolean);
+      exts = String(q.ext).split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
     }
 
-    const base = _externalBase(req);
-    const prefix = "/files"; // prefix publik yang sudah kamu pakai
     const files = await walkDir(UPLOADS_DIR, recursive);
 
-    // mapping ke output + filter ext
     const items = files
       .filter(f => {
         if (!exts) return true;
@@ -172,9 +206,7 @@ app.get("/files-list", async (req, res) => {
       })
       .map(f => {
         const filename = path2.basename(f.relPath);
-        // URL publik pertahankan subfolder jika ada
-        const urlPath = `${prefix}/${encodeURI(f.relPath)}`.replace(/#/g, "%23");
-        // type sederhana dari ekstensi
+        const url = buildFileUrl(f.relPath); // ABSOLUT ke domain kamu
         const ext = path2.extname(filename).slice(1).toLowerCase();
         const mime =
           ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
@@ -183,19 +215,11 @@ app.get("/files-list", async (req, res) => {
           ext === "gif" ? "image/gif" :
           ext === "svg" ? "image/svg+xml" :
           "application/octet-stream";
-        return {
-          id: filename,
-          filename,
-          path: f.relPath,
-          url: `${base}${urlPath}`,
-          size: f.size,
-          type: mime,
-          mtime: f.mtime,
-          ctime: f.ctime,
-        };
+        return { id: filename, filename, path: f.relPath, url, size: f.size, type: mime, mtime: f.mtime, ctime: f.ctime };
       });
 
-      const cmp = (a, b) => {
+    // sorting
+    items.sort((a, b) => {
       let vA, vB;
       if (sortBy === "size") { vA = a.size; vB = b.size; }
       else if (sortBy === "mtime") { vA = a.mtime; vB = b.mtime; }
@@ -203,107 +227,29 @@ app.get("/files-list", async (req, res) => {
       if (vA < vB) return -1;
       if (vA > vB) return 1;
       return 0;
-    };
-    items.sort(cmp);
+    });
     if (order === "desc") items.reverse();
 
     const total = items.length;
     const sliced = limit ? items.slice(offset, offset + limit) : (offset ? items.slice(offset) : items);
 
     if (format === "txt") {
-      // daftar URL baris-per-baris (mudah buat copy-paste)
       res.type("text/plain").send(sliced.map(it => it.url).join("\n"));
       return;
     }
 
-    res.json({
-      base,
-      prefix,
-      total,
-      count: sliced.length,
-      offset,
-      limit: limit || null,
-      items: sliced,
-    });
+    res.json({ base: externalBase(), prefix: "/files", total, count: sliced.length, offset, limit: limit || null, items: sliced });
   } catch (e) {
     console.error("[files-list] error:", e);
     res.status(500).json({ error: "Failed to list files" });
   }
 });
 
-
-app.post("/upload", upload.array("files", 200), async (req, res) => {
-  try {
-    const files = req.files || [];
-    const now = new Date().toISOString();
-
-    const db = await readDB();
-
-    const results = [];
-    for (const f of files) {
-      const filename = f.originalname;
-      const idx = db.images.findIndex((x) => x.filename === filename);
-      const record = {
-        id: filename,
-        filename,
-        size: f.size,
-        type: f.mimetype,
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      if (idx >= 0) {
-        // pertahankan createdAt lama
-        record.createdAt = db.images[idx].createdAt || now;
-        db.images[idx] = record;
-      } else {
-        db.images.push(record);
-      }
-
-      results.push({
-        filename,
-        url: buildFileUrl(req, filename), // balas absolut sesuai domain/proxy
-        status: idx >= 0 ? "overwritten" : "uploaded",
-      });
-    }
-
-    await writeDB(db);
-    res.json({ uploaded: results, count: results.length });
-  } catch (e) {
-    console.error("[upload] error:", e);
-    res.status(500).json({ error: "Upload failed" });
-  }
-});
-
-// ====== List images (rebase URL jika perlu) ======
-app.get("/images", async (req, res) => {
-  try {
-    const db = await readDB();
-    const base = externalBase(req);
-    const list = (db.images || []).map((it) => {
-      // Selalu kirim URL absolut yang benar (tidak localhost)
-      // Jika sebelumnya ada url lama, abaikan; bangun dari filename
-      return {
-        ...it,
-        url: `${base}/files/${encodeURIComponent(it.filename)}`,
-      };
-      // Kalau lebih suka relatif, ganti baris di atas dengan:
-      // url: `/files/${encodeURIComponent(it.filename)}`
-    });
-    res.json(list);
-  } catch (e) {
-    console.error("[images] error:", e);
-    res.status(500).json({ error: "Failed to load images" });
-  }
-});
-
-// ====== Delete by filename atau url (opsional, berguna) ======
+// ====== Delete by filename/url ======
 app.delete("/images", express.json(), async (req, res) => {
   try {
     const { filenames = [], urls = [] } = req.body || {};
     const targets = new Set(filenames);
-
-    // Ekstrak filename dari urls
     for (const u of urls) {
       try {
         const p = new URL(u).pathname; // /files/NAME
@@ -311,19 +257,14 @@ app.delete("/images", express.json(), async (req, res) => {
         if (m) targets.add(decodeURIComponent(m[1]));
       } catch {}
     }
-
-    if (targets.size === 0)
-      return res.status(400).json({ error: "Provide filenames or urls" });
+    if (targets.size === 0) return res.status(400).json({ error: "Provide filenames or urls" });
 
     const db = await readDB();
     const kept = [];
     const deleted = [];
     for (const it of db.images) {
       if (targets.has(it.filename)) {
-        // hapus file di disk
-        try {
-          await fsp.unlink(path.join(UPLOADS_DIR, it.filename));
-        } catch {}
+        try { await fsp.unlink(path.join(UPLOADS_DIR, it.filename)); } catch {}
         deleted.push(it.filename);
       } else {
         kept.push(it);
@@ -341,7 +282,7 @@ app.delete("/images", express.json(), async (req, res) => {
 // ====== Healthcheck ======
 app.get("/health", (_req, res) => res.send("ok"));
 
-// ====== (Opsional) Mount json-server di /db jika tersedia ======
+// ====== (Opsional) json-server untuk db.json ======
 try {
   const jsonServer = require("json-server");
   const router = jsonServer.router(DB_FILE);
@@ -356,4 +297,5 @@ try {
 app.listen(PORT, "127.0.0.1", () => {
   console.log(`[v0] Image backend running at http://localhost:${PORT}`);
   console.log(`[v0] Files served from ${UPLOADS_DIR} at /files/{filename}`);
+  console.log(`[v0] PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}`);
 });
