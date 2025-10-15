@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "node scripts/one-run.js dev",
+    "dev": "node scripts/one-run.js dev --turbopack",
     "start": "node scripts/one-run.js start",
     "build": "node scripts/one-run.js build"
   },
