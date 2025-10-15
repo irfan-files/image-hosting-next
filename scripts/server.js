@@ -21,6 +21,9 @@ const fsp = require("fs/promises");
 const path = require("path");
 const express = require("express");
 const multer = require("multer");
+const { statSync } = require("fs");
+const fsp2 = require("fs/promises");
+const path2 = require("path");
 
 // ====== Konfigurasi dasar ======
 const PORT = parseInt(process.env.PORT || "4000", 10);
@@ -71,6 +74,12 @@ function externalBase(req) {
   const host = req.headers["x-forwarded-host"] || req.get("host");
   return `${proto}://${host}`;
 }
+function _externalBase(req) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/+$/, "");
+  const proto = req.headers["x-forwarded-proto"] || req.protocol;
+  const host  = req.headers["x-forwarded-host"]  || req.get("host");
+  return `${proto}://${host}`;
+}
 function buildFileUrl(req, filename) {
   const base = externalBase(req);
   return `${base}/files/${encodeURIComponent(filename)}`;
@@ -100,6 +109,128 @@ const storage = multer.diskStorage({
   },
 });
 const upload = multer({ storage });
+
+async function walkDir(root, recursive) {
+  const out = [];
+  const stack = [""];
+  while (stack.length) {
+    const rel = stack.pop();
+    const dir = path2.join(root, rel);
+    const entries = await fsp2.readdir(dir, { withFileTypes: true });
+    for (const ent of entries) {
+      const relPath = rel ? path2.join(rel, ent.name) : ent.name;
+      const full = path2.join(root, relPath);
+      if (ent.isDirectory()) {
+        if (recursive) stack.push(relPath);
+        continue;
+      }
+      // skip hidden files (opsional)
+      if (ent.name.startsWith(".")) continue;
+      try {
+        const st = statSync(full);
+        out.push({
+          relPath: relPath.replace(/\\/g, "/"),
+          size: st.size,
+          mtime: st.mtime.toISOString(),
+          ctime: st.ctime.toISOString(),
+        });
+      } catch {}
+    }
+  }
+  return out;
+}
+
+app.get("/files-list", async (req, res) => {
+  try {
+    const q = req.query || {};
+    const recursive = String(q.recursive || "").toLowerCase() === "true";
+    const format    = (q.format || "").toLowerCase();      // "txt" untuk daftar URL saja
+    const sortBy    = (q.sort || "name").toLowerCase();    // name|mtime|size
+    const order     = (q.order || "asc").toLowerCase();    // asc|desc
+    const limit     = Math.max(0, parseInt(q.limit || "0", 10));
+    const offset    = Math.max(0, parseInt(q.offset || "0", 10));
+
+    // filter ekstensi
+    let exts = null;
+    if (q.ext) {
+      exts = String(q.ext)
+        .split(",")
+        .map(s => s.trim().toLowerCase())
+        .filter(Boolean);
+    }
+
+    const base = _externalBase(req);
+    const prefix = "/files"; // prefix publik yang sudah kamu pakai
+    const files = await walkDir(UPLOADS_DIR, recursive);
+
+    // mapping ke output + filter ext
+    const items = files
+      .filter(f => {
+        if (!exts) return true;
+        const ext = path2.extname(f.relPath).slice(1).toLowerCase();
+        return exts.includes(ext);
+      })
+      .map(f => {
+        const filename = path2.basename(f.relPath);
+        // URL publik pertahankan subfolder jika ada
+        const urlPath = `${prefix}/${encodeURI(f.relPath)}`.replace(/#/g, "%23");
+        // type sederhana dari ekstensi
+        const ext = path2.extname(filename).slice(1).toLowerCase();
+        const mime =
+          ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
+          ext === "png" ? "image/png" :
+          ext === "webp" ? "image/webp" :
+          ext === "gif" ? "image/gif" :
+          ext === "svg" ? "image/svg+xml" :
+          "application/octet-stream";
+        return {
+          id: filename,
+          filename,
+          path: f.relPath,
+          url: `${base}${urlPath}`,
+          size: f.size,
+          type: mime,
+          mtime: f.mtime,
+          ctime: f.ctime,
+        };
+      });
+
+      const cmp = (a, b) => {
+      let vA, vB;
+      if (sortBy === "size") { vA = a.size; vB = b.size; }
+      else if (sortBy === "mtime") { vA = a.mtime; vB = b.mtime; }
+      else { vA = a.filename.toLowerCase(); vB = b.filename.toLowerCase(); }
+      if (vA < vB) return -1;
+      if (vA > vB) return 1;
+      return 0;
+    };
+    items.sort(cmp);
+    if (order === "desc") items.reverse();
+
+    const total = items.length;
+    const sliced = limit ? items.slice(offset, offset + limit) : (offset ? items.slice(offset) : items);
+
+    if (format === "txt") {
+      // daftar URL baris-per-baris (mudah buat copy-paste)
+      res.type("text/plain").send(sliced.map(it => it.url).join("\n"));
+      return;
+    }
+
+    res.json({
+      base,
+      prefix,
+      total,
+      count: sliced.length,
+      offset,
+      limit: limit || null,
+      items: sliced,
+    });
+  } catch (e) {
+    console.error("[files-list] error:", e);
+    res.status(500).json({ error: "Failed to list files" });
+  }
+});
+
 
 app.post("/upload", upload.array("files", 200), async (req, res) => {
   try {
