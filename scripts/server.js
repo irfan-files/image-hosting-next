@@ -24,8 +24,8 @@ const path2 = require("path");
 
 // ====== Konfigurasi dasar ======
 const PORT = parseInt(process.env.PORT || "4000", 10);
-const UPLOADS_DIR = "../uploads";
-const DATA_DIR = "../data";
+const UPLOADS_DIR = "/tmp/uploads";
+const DATA_DIR = "/tmp/data";
 const DB_FILE = path.join(DATA_DIR, "db.json");
 // Default ke domain kamu; bisa override via ENV
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://uploadimage.xyz").replace(/\/+$/, "");
