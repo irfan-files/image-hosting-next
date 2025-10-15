@@ -426,6 +426,20 @@ app.delete("/files/:name", async (req, res) => {
   }
 });
 
+app.delete("/images", parseFields, async (req, res) => {
+  try {
+    const targets = collectTargets(req);   // sudah mendukung banyak nama field (filenames, urls, selected, dsb.)
+    if (targets.size === 0) {
+      return res.status(400).json({ error: "Provide filenames or urls" });
+    }
+    const { deleted } = await deleteByTargets(targets);
+    return res.json({ deleted, count: deleted.length, method: "DELETE /images" });
+  } catch (e) {
+    console.error("[delete legacy /images] error:", e);
+    return res.status(500).json({ error: "Delete failed" });
+  }
+});
+
 // ====== Healthcheck ======
 app.get("/health", (_req, res) => res.send("ok"));
 
