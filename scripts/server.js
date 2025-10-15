@@ -97,10 +97,17 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_DIR),
   filename: (req, file, cb) => cb(null, file.originalname),
 });
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: {
+    files: 100000,      // naikkan sesuai kebutuhan (mis. 10.000 file)
+    // fileSize: 50 * 1024 * 1024, // (opsional) batasi per-file 50MB
+    // parts: 0, // biarkan default
+  },
+});
 
 // Upload: simpan meta di DB (tanpa host), balas URL absolut berbasis PUBLIC_BASE_URL
-app.post("/upload", upload.array("files", 200), async (req, res) => {
+app.post("/upload", upload.array("files", 10000), async (req, res) => {
   try {
     const files = req.files || [];
     const now = new Date().toISOString();
