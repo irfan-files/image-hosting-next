@@ -111,9 +111,11 @@ printBanner();
 
 // ===== Start backend
 console.log("[v0] starting backend: node scripts/server.js");
+// YANG HARUS ADA (mode dev/start)
 const backend = startChild("backend", process.execPath, [
   path.join("scripts", "server.js"),
 ], baseEnv);
+
 
 // ===== Start Next.js (dev|start)
 let nextCmd = "";

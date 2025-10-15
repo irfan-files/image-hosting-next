@@ -147,16 +147,47 @@ app.post("/upload", upload.array("files", 100000), async (req, res) => {
 });
 
 // List images: selalu bangun URL dari filename (abaikan url lama di DB)
-app.get("/images", async (_req, res) => {
+app.get("/images", async (req, res) => {
   try {
+    // ambil DB sekarang
     const db = await readDB();
-    const list = (db.images || []).map((it) => ({
-      ...it,
-      url: buildFileUrl(it.filename),
-    }));
+    const byName = new Map((db.images || []).map(it => [it.filename, it]));
+
+    // scan folder uploads (pakai walkDir yang sudah ada)
+    const files = await walkDir(UPLOADS_DIR, true); // true = recursive
+
+    // bentuk list final dari isi FOLDER (bukan dari DB)
+    const list = files.map(f => {
+      const filename = path2.basename(f.relPath);
+      const rec = byName.get(filename) || {};
+      const url = buildFileUrl(f.relPath);
+      // infer MIME dasar dari ekstensi
+      const ext = path2.extname(filename).slice(1).toLowerCase();
+      const mime =
+        ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
+        ext === "png" ? "image/png" :
+        ext === "webp" ? "image/webp" :
+        ext === "gif" ? "image/gif" :
+        ext === "svg" ? "image/svg+xml" :
+        "application/octet-stream";
+      return {
+        filename,
+        url,
+        size: f.size,
+        type: mime,
+        mime,
+        createdAt: rec.createdAt || f.ctime,  // fallback waktu file
+        updatedAt: rec.updatedAt || f.mtime,  // fallback waktu file
+      };
+    });
+
+    // (opsional) sinkronkan DB supaya next time makin cepat
+    // db.images = list.map(({url, type, mime, ...keep}) => keep); // simpan tanpa field 'url'
+    // await writeDB(db);
+
     res.json(list);
   } catch (e) {
-    console.error("[images] error:", e);
+    console.error("[images-scan] error:", e);
     res.status(500).json({ error: "Failed to load images" });
   }
 });
