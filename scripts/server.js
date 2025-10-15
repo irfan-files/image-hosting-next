@@ -66,8 +66,8 @@ app.use((req, res, next) => {
 });
 
 // Body parser untuk JSON & form-urlencoded
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+app.use(express.json({ limit: "50000mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50000mb" }));
 
 // Base URL selalu memakai PUBLIC_BASE_URL
 function externalBase() {
@@ -107,7 +107,7 @@ const upload = multer({
 });
 
 // Upload: simpan meta di DB (tanpa host), balas URL absolut berbasis PUBLIC_BASE_URL
-app.post("/upload", upload.array("files", 10000), async (req, res) => {
+app.post("/upload", upload.array("files", 100000), async (req, res) => {
   try {
     const files = req.files || [];
     const now = new Date().toISOString();
